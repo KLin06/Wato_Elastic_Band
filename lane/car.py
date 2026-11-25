@@ -33,6 +33,8 @@ import numpy as np
 CAR_WIDTH = 2.0      # m
 CAR_LENGTH = 5.0     # m
 BAND_LENGTH = 15.0   # m of global path the elastic band covers, ahead of the car
+STOP_BACKOFF = 1.0   # m, the car stops this far before a point the corridor can't clear
+DETOUR_OFFSET = 0.1  # m off the reference that counts as a detour (status)
 
 
 @dataclass
@@ -53,6 +55,9 @@ class Car:
     band: object = field(default=None, init=False, repr=False)
     tail_idx: int = field(default=0, init=False, repr=False)   # last global-path index in the band
     trail: list = field(default_factory=list, init=False, repr=False)  # positions driven so far
+    # Allowed lanes as (x_from, x_to, (lowest_lane, highest_lane)) pieces; None = whole road.
+    corridor: list = field(default=None, init=False, repr=False)
+    blocked_idx: int = field(default=None, init=False, repr=False)  # first reference point no shift can clear
 
     # ======================================================================
     # Geometry
@@ -85,7 +90,7 @@ class Car:
         self.costmap = costmap
         self.global_planner = (Planner(costmap) if cost_weight is None
                                else Planner(costmap, cost_weight=cost_weight))
-        self.band_map = BandMap(costmap)
+        self.band_map = BandMap(costmap)       # replaced once a corridor is set
 
     def plan(self, start_y=None, end_y=None):
         """Run the global planner from x = 0 at start_y to the end of the road at
@@ -94,20 +99,70 @@ class Car:
         if self.global_planner is None:
             raise RuntimeError("call set_costmap() first")
         self.global_path, self.global_cost = self.global_planner.plan(start_y, end_y)
+        self._set_corridor(None)                    # search planner: whole road allowed
         return self._start_on_path()
 
-    def plan_reference(self, lane=2, target_lane=None, change_x=15.0, blend_length=20.0):
+    def plan_reference(self, lane=2, target_lane=None, change_x=15.0, blend_length=20.0,
+                       corridor_margin=2.0):
         """Use a reference line (reference.py) instead of the search planner:
         the centreline of `lane`, optionally blending into `target_lane`
         starting at `change_x` over `blend_length` metres. The band is pulled
-        toward this line. Puts the car at its start. Returns the path."""
+        toward this line. Puts the car at its start. Returns the path.
+
+        Also sets the allowed-lane CORRIDOR (what the decision layer authorises):
+          staying           : `lane` along the whole road
+          changing lanes    : `lane` before change_x; every lane from `lane` to
+                              `target_lane` from change_x until `corridor_margin`
+                              metres after the change ends; `target_lane` after.
+        """
         from reference import lane_reference
 
         if self.costmap is None:
             raise RuntimeError("call set_costmap() first")
         self.global_path = lane_reference(self.costmap, lane, target_lane, change_x, blend_length)
         self.global_cost = float("nan")
+
+        L = self.costmap.length
+        if target_lane is None or target_lane == lane:
+            corridor = [(0.0, L, (lane, lane))]
+        else:
+            lo, hi = min(lane, target_lane), max(lane, target_lane)
+            end = change_x + blend_length + corridor_margin
+            corridor = [(0.0, change_x, (lane, lane)),
+                        (change_x, end, (lo, hi)),
+                        (end, L, (target_lane, target_lane))]
+        self._set_corridor(corridor)
         return self._start_on_path()
+
+    # ======================================================================
+    # Corridor (allowed lanes)
+    # ======================================================================
+    def _set_corridor(self, corridor):
+        """Store the corridor and rebuild the band's obstacle map with it."""
+        from elastic_band import BandMap
+
+        self.corridor = corridor
+        self.band_map = BandMap(self.costmap, inside=self.corridor_mask())
+
+    def corridor_mask(self):
+        """Bool grid (rows, cols): True where the car's CENTRE keeps the whole
+        car inside the allowed lanes, i.e. between the lowest allowed lane's
+        right line + half the car width and the highest allowed lane's left
+        line - half the car width. None if the whole road is allowed."""
+        if self.corridor is None:
+            return None
+        cm = self.costmap
+        x = (np.arange(cm.cols) + 0.5) * cm.resolution
+        y = (np.arange(cm.rows) + 0.5) * cm.resolution
+        inside = np.zeros((cm.rows, cm.cols), dtype=bool)
+        half_car = self.width / 2
+        for x0, x1, (lo, hi) in self.corridor:
+            cols = (x >= x0) & (x < x1) if x1 < cm.length else (x >= x0)
+            y_min = cm.boundaries[lo - 1] + half_car
+            y_max = cm.boundaries[hi] - half_car
+            rows = (y >= y_min) & (y <= y_max)
+            inside |= rows[:, None] & cols[None, :]
+        return inside
 
     def _start_on_path(self):
         """Put the car at the start of the global path, facing along it, and
@@ -148,8 +203,11 @@ class Car:
         path = np.asarray(path, float)
         shifts = np.zeros(len(path))
         sign = None
+        self.blocked_idx = None
         for j, p in enumerate(path):                       # shift needed at each point
             s = self._clear_shift(p, sign)
+            if s is None and self.blocked_idx is None:     # no shift inside the corridor clears it
+                self.blocked_idx = j
             if s:                                          # blocked: keep one side per obstacle
                 shifts[j], sign = s, (1 if s > 0 else -1)
             else:
@@ -168,6 +226,15 @@ class Car:
         clear[:, 1] += spread
         return clear
 
+    @property
+    def stop_idx(self):
+        """Last global-path index the band may extend to: the end of the road,
+        or STOP_BACKOFF metres before the first point the corridor can't clear."""
+        if self.blocked_idx is None:
+            return len(self.global_path) - 1
+        ds = max(np.linalg.norm(self.global_path[1] - self.global_path[0]), 1e-6)
+        return max(self.blocked_idx - int(STOP_BACKOFF / ds), 0)
+
     def band_window(self):
         """The piece of the global path the band covers: from the car's position
         to `band_length` metres further along the path."""
@@ -180,7 +247,7 @@ class Car:
         window = [self.position.copy()]
         dist = 0.0
         self.tail_idx = i0
-        for j in range(i0 + 1, len(path)):
+        for j in range(i0 + 1, self.stop_idx + 1):
             dist += float(np.linalg.norm(path[j] - window[-1]))
             window.append(self.reference[j])
             self.tail_idx = j
@@ -210,6 +277,30 @@ class Car:
         return (self.global_path is not None
                 and self.tail_idx == len(self.global_path) - 1
                 and np.linalg.norm(self.position - self.global_path[-1]) < 0.05)
+
+    @property
+    def status(self):
+        """What the car is doing, for the decision layer:
+          done       reached the end of the reference
+          blocked    stopped: nothing inside the corridor clears the obstacle ahead
+          detour     off the reference to pass an obstacle: the reference is
+                     shifted here, or the band has pushed the car more than
+                     DETOUR_OFFSET off it
+          following  on the reference
+        """
+        if self.global_path is None:
+            return "idle"
+        if self.done:
+            return "done"
+        if (self.blocked_idx is not None and self.band is not None
+                and self.tail_idx >= self.stop_idx
+                and np.linalg.norm(self.position - self.band.points[-1]) < 0.05):
+            return "blocked"
+        i = int(np.argmin(np.linalg.norm(self.global_path - self.position, axis=1)))
+        if (abs(self.reference[i, 1] - self.global_path[i, 1]) > 1e-6
+                or np.linalg.norm(self.position - self.global_path[i]) > DETOUR_OFFSET):
+            return "detour"
+        return "following"
 
     def drive_step(self, distance=0.2, band_steps=3):
         """Drive `distance` metres along the band, then slide the band forward.
@@ -253,7 +344,7 @@ class Car:
         # 2) Extend the far end along the global path back up to band_length.
         length = float(np.sum(np.linalg.norm(np.diff(new_pts, axis=0), axis=1))) \
             if len(new_pts) > 1 else 0.0
-        while length < self.band_length and self.tail_idx < len(path) - 1:
+        while length < self.band_length and self.tail_idx < self.stop_idx:
             self.tail_idx += 1
             length += float(np.linalg.norm(path[self.tail_idx] - new_pts[-1]))
             new_pts.append(self.reference[self.tail_idx])
@@ -272,6 +363,8 @@ class Car:
             s += f"\n  global path: {len(self.global_path)} points, cost {self.global_cost:.2f}"
         if self.band is not None:
             s += f"\n  band ({self.band_length:g} m window): {self.band}"
+        if self.global_path is not None:
+            s += f"\n  status: {self.status}"
         return s
 
 

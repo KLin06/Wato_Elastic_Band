@@ -15,10 +15,15 @@ toward it while being pushed off obstacles.
   python drive.py --planner search --end-y 8.33     old search planner instead
   python drive.py --save drive.gif                  save a GIF instead of a window
 
+The car may only use the lanes the corridor allows (its lane, plus the target
+lane during a lane change). If nothing inside the corridor clears an
+obstacle, the car stops before it and reports BLOCKED.
+
 On screen: grey dashed = global path, cyan dotted = reference the band is
-pulled toward (global path shifted clear of obstacles), blue = elastic band
+pulled toward (global path shifted clear of obstacles), grey shading = where
+the car's centre may not go (outside the corridor), blue = elastic band
 (circles = bubbles), green line = where the car has driven, green box = the
-car, red box = the obstacle.
+car, red box = the obstacle, red dashed line = blocked point.
 """
 import argparse
 
@@ -93,6 +98,16 @@ def main():
     if not np.allclose(ref, gp):
         ax.plot(ref[:, 0], ref[:, 1], ":", color="tab:cyan", lw=1.5, label="reference (clear)")
 
+    # Corridor: shade where the car's CENTRE isn't allowed (outside the allowed lanes).
+    inside = car.corridor_mask()
+    if inside is not None:
+        ax.imshow(np.where(inside, np.nan, 1.0), cmap="Greys", origin="lower", extent=cm.extent,
+                  vmin=0, vmax=2, alpha=0.45, interpolation="nearest")
+        ax.plot([], [], "s", color="gray", alpha=0.6, label="outside corridor (for car centre)")
+    if car.blocked_idx is not None:
+        bx = car.global_path[car.blocked_idx, 0]
+        ax.axvline(bx, color="tab:red", ls="--", lw=1.5, label="blocked")
+
     # ---- Moving parts --------------------------------------------------------
     (trail_line,) = ax.plot([], [], "-", color="tab:green", lw=2, label="driven")
     (band_line,) = ax.plot([], [], "-o", color="tab:blue", ms=3, lw=2,
@@ -127,8 +142,7 @@ def main():
         lane = cm.lane_of(car.y)
         info.set_text(f"x {car.x:5.1f} m  y {car.y:4.2f} m  lane {lane}  "
                       f"yaw {np.degrees(car.yaw):5.1f} deg  "
-                      f"cost here {cm.cost_at(car.x, car.y):3d}"
-                      + ("   ARRIVED" if car.done else ""))
+                      f"status {car.status.upper()}")
 
     def update(_):
         if not car.done:

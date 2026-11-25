@@ -6,15 +6,20 @@ The band takes a piece of the global path and reshapes it: it TIGHTENS
 "bubbles": each band point has a radius = distance to the nearest obstacle,
 and neighbouring bubbles must overlap so the band stays collision free.
 
-What counts as an obstacle here
--------------------------------
-The lane costmap has graded costs (0..100). For the band, every cell with
-cost >= OBSTACLE_COST is an obstacle and everything else is free space.
-OBSTACLE_COST is set just above OUT_OF_LANE_COST, so:
-  - road edges (and the car being over them) are obstacles
-  - crossing a dashed lane line is NOT an obstacle, so the band can follow
-    a lane change from the global planner
-Costs below the threshold don't push the band at all.
+What counts as an obstacle here: obstacle grid + corridor
+----------------------------------------------------------
+The band only needs to know where it may NOT go; that is the paper's model
+(bubble radius = distance to the nearest obstacle). Two sources:
+
+  1. Obstacle grid: costmap cells with cost >= OBSTACLE_COST (lethal):
+     objects (grown by the car's size) and the car being over a road edge.
+  2. Corridor: the lanes the decision layer allows. Wherever the car's
+     centre would put part of the car outside them is also an obstacle
+     (see Car.corridor_mask()). This keeps the car in its lane(s) with the
+     same collision-free guarantee as for objects.
+
+The costmap's graded lane costs (centring, lane lines, out-of-lane) are not
+used: the reference pull centres the band and the corridor bounds it.
 
 One update step
 ---------------
@@ -40,9 +45,9 @@ import numpy as np
 from scipy.ndimage import distance_transform_edt, map_coordinates
 from scipy.spatial import cKDTree
 
-from lane_costmap import OUT_OF_LANE_COST, LaneCostmap
+from lane_costmap import LETHAL, LaneCostmap
 
-OBSTACLE_COST = OUT_OF_LANE_COST + 1   # cells at or above this are obstacles for the band
+OBSTACLE_COST = LETHAL     # cells at or above this are obstacles for the band
 
 
 def unit(v):
@@ -54,14 +59,18 @@ def unit(v):
 class BandMap:
     """Distance-to-obstacle view of a LaneCostmap, which is what the band needs.
 
+    inside      : optional bool grid (rows, cols), True where the car's centre
+                  is inside the allowed corridor; outside counts as obstacle
     rho(p)      : distance (m) from world point p to the nearest obstacle cell
     grad_rho(p) : direction that increases rho fastest (away from obstacles)
     """
 
-    def __init__(self, costmap: LaneCostmap, obstacle_cost=OBSTACLE_COST):
+    def __init__(self, costmap: LaneCostmap, obstacle_cost=OBSTACLE_COST, inside=None):
         self.cm = costmap
         self.resolution = costmap.resolution
         free = costmap.grid < obstacle_cost
+        if inside is not None:
+            free &= inside
         self.dist = distance_transform_edt(free) * self.resolution
         gy, gx = np.gradient(self.dist, self.resolution)   # rows = y, cols = x
         self.grad_x, self.grad_y = gx, gy
