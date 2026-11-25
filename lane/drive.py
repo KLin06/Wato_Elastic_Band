@@ -19,22 +19,24 @@ The car may only use the lanes the corridor allows (its lane, plus the target
 lane during a lane change). If nothing inside the corridor clears an
 obstacle, the car stops before it and reports BLOCKED.
 
-On screen: grey dashed = global path, cyan dotted = reference the band is
-pulled toward (global path shifted clear of obstacles), grey shading = where
-the car's centre may not go (outside the corridor), blue = elastic band
-(circles = bubbles), green line = where the car has driven, green box = the
-car, red box = the obstacle, red dashed line = blocked point.
+On screen (plain road, no cost colours): grey dashed = global path, cyan
+dotted = reference the band is pulled toward (global path shifted clear of
+obstacles), orange lines = lane walls for the car centre (1 m inside the
+lane lines the car may not cross), pink dashed = walls removed for a lane
+change, blue = elastic band (circles =
+bubbles), green line = where the car has driven, green box = the car, red
+box = the obstacle, orange box around it = its no-go zone for the car centre
+(a wall: where the car would touch it), red dashed line = blocked point.
 """
 import argparse
-
 import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.animation import FuncAnimation, PillowWriter
-from matplotlib.collections import PatchCollection
+from matplotlib.collections import LineCollection, PatchCollection
 from matplotlib.patches import Circle, Polygon
 
 from car import Car
-from lane_costmap import LETHAL, LaneCostmap
+from lane_costmap import LaneCostmap
 from obstacle import Obstacle
 
 
@@ -52,7 +54,7 @@ def main():
                     help="reference mode: lane-change length in m (default 20)")
     ap.add_argument("--start-y", type=float, default=None, help="search mode: start y (default: lane 2 centre)")
     ap.add_argument("--end-y", type=float, default=None, help="search mode: end y (default: lane 2 centre)")
-    ap.add_argument("--obstacle-x", type=float, default=None, help="obstacle x (default 25)")
+    ap.add_argument("--obstacle-x", type=float, default=None, help="obstacle x (default 10)")
     ap.add_argument("--obstacle-y", type=float, default=None,
                     help="obstacle y (default 3.63: right side of lane 2)")
     ap.add_argument("--speed", type=float, default=0.2, help="metres driven per frame (default 0.2)")
@@ -78,10 +80,9 @@ def main():
         car.plan(args.start_y, args.end_y)
     car.update_band()
 
-    # ---- Static background ---------------------------------------------------
+    # ---- Static background: plain road, lane markings, obstacles -------------
     fig, ax = plt.subplots(figsize=(13, 4.5))
-    ax.imshow(cm.grid, cmap="magma_r", origin="lower", extent=cm.extent,
-              vmin=0, vmax=LETHAL, interpolation="nearest")
+    ax.set_facecolor("#b0b0b0")                       # road surface
     for i, by in enumerate(cm.boundaries):
         is_edge = i == 0 or i == len(cm.boundaries) - 1
         ax.axhline(by, color="black" if is_edge else "white",
@@ -89,21 +90,70 @@ def main():
     for k, cy in enumerate(cm.centers):
         ax.text(0.5, cy, f"Lane {k + 1}", va="center", fontsize=9, weight="bold",
                 bbox=dict(facecolor="white", alpha=0.8, lw=0))
-    for obs in obstacles:
+    # Obstacles: the red box is the obstacle itself. The orange wall around it
+    # is its NO-GO ZONE for the car's centre: where the car would touch it,
+    # i.e. the obstacle grown by half the car's length (2.5 m) along the road
+    # and half its width (1 m) across it. This is what the band stays outside.
+    for i, obs in enumerate(obstacles):
         ax.add_patch(Polygon(obs.footprint(), closed=True, fc="tab:red", ec="black",
-                             zorder=6, label="obstacle"))
+                             zorder=6, label="obstacle" if i == 0 else None))
+        zone = Obstacle(obs.x, obs.y, obs.length + car.length, obs.width + car.width)
+        ax.add_patch(Polygon(zone.footprint(), closed=True, fill=False, ec="tab:orange",
+                             lw=4, joinstyle="miter", zorder=4,
+                             label="obstacle no-go zone (wall, car centre)" if i == 0 else None))
     gp = car.global_path
     ax.plot(gp[:, 0], gp[:, 1], "--", color="gray", lw=1.5, label="global path")
     ref = car.reference
     if not np.allclose(ref, gp):
         ax.plot(ref[:, 0], ref[:, 1], ":", color="tab:cyan", lw=1.5, label="reference (clear)")
 
-    # Corridor: shade where the car's CENTRE isn't allowed (outside the allowed lanes).
-    inside = car.corridor_mask()
-    if inside is not None:
-        ax.imshow(np.where(inside, np.nan, 1.0), cmap="Greys", origin="lower", extent=cm.extent,
-                  vmin=0, vmax=2, alpha=0.45, interpolation="nearest")
-        ax.plot([], [], "s", color="gray", alpha=0.6, label="outside corridor (for car centre)")
+    # Corridor as WALLS for the car's CENTRE (same as the obstacle no-go
+    # zones): half a car width (1 m) inside each lane line bounding the
+    # allowed lanes, i.e. where the car's side would touch that line (orange).
+    # During a lane change the walls on both sides of the line between the
+    # source and target lane are removed (pink dashed), which is what lets
+    # the car cross it.
+    # Animated: up to the band's far end the real corridor is drawn; beyond
+    # it, the corridor at the far end is carried forward. So the wall visibly
+    # disappears when the band reaches the lane-change point, which is when
+    # the band starts using the extra lane.
+    def corridor_lanes_at(x):
+        """(lowest, highest) allowed lane at road position x."""
+        for x0, x1, lanes in car.corridor:
+            if x0 <= x < x1:
+                return lanes
+        return car.corridor[-1][2]
+
+    def visible_pieces():
+        """Corridor pieces (x_from, x_to, (lo, hi)) as currently drawn."""
+        tail_x = car.band.points[-1, 0]
+        pieces = [(x0, min(x1, tail_x), lanes) for x0, x1, lanes in car.corridor if x0 < tail_x]
+        pieces.append((tail_x, cm.length, corridor_lanes_at(tail_x)))
+        return pieces
+
+    half_car = car.width / 2
+
+    def wall_segments():
+        walls, removed = [], []
+        for x0, x1, (lo, hi) in visible_pieces():
+            # Outer lines: wall 1 m inside each (above the lowest, below the highest).
+            for y in (cm.boundaries[lo - 1] + half_car, cm.boundaries[hi] - half_car):
+                walls.append([(x0, y), (x1, y)])
+            # Lines between allowed lanes: the walls on both sides are removed.
+            for k in range(lo, hi):
+                for y in (cm.boundaries[k] - half_car, cm.boundaries[k] + half_car):
+                    removed.append([(x0, y), (x1, y)])
+        return walls, removed
+
+    wall_lc = removed_lc = None
+    if car.corridor is not None:
+        walls, removed = wall_segments()
+        wall_lc = LineCollection(walls, colors="tab:orange", linewidths=5, alpha=0.85,
+                                 zorder=3, label="lane wall (car centre)")
+        removed_lc = LineCollection(removed, colors="tab:pink", linewidths=4, linestyles="--",
+                                    zorder=3, label="wall removed (crossing allowed)")
+        ax.add_collection(wall_lc)
+        ax.add_collection(removed_lc)
     if car.blocked_idx is not None:
         bx = car.global_path[car.blocked_idx, 0]
         ax.axvline(bx, color="tab:red", ls="--", lw=1.5, label="blocked")
@@ -137,12 +187,19 @@ def main():
         if bubbles[0] is not None:
             bubbles[0].remove()
         bubbles[0] = PatchCollection([Circle(p, r) for p, r in zip(b.points, b.radii())],
-                                     fc="tab:blue", alpha=0.15, ec="none")
+                                     fc=(0.12, 0.47, 0.71, 0.12), ec=(0.12, 0.47, 0.71, 0.8),
+                                     lw=0.8, zorder=3)
         ax.add_collection(bubbles[0])
+        corridor_text = ""
+        if wall_lc is not None:
+            walls, removed = wall_segments()
+            wall_lc.set_segments(walls)
+            removed_lc.set_segments(removed)
+            lo, hi = corridor_lanes_at(b.points[-1, 0])
+            corridor_text = f"  corridor ahead: lane {lo}" + (f"-{hi}" if hi != lo else "")
         lane = cm.lane_of(car.y)
         info.set_text(f"x {car.x:5.1f} m  y {car.y:4.2f} m  lane {lane}  "
-                      f"yaw {np.degrees(car.yaw):5.1f} deg  "
-                      f"status {car.status.upper()}")
+                      f"status {car.status.upper()}" + corridor_text)
 
     def update(_):
         if not car.done:

@@ -1,7 +1,7 @@
 """
 Obstacle model: a small axis-aligned box on the road (debris, a cone, ...).
 
-Default: 1.0 m long x 0.5 m wide, in lane 2 at x = 25 m, against the RIGHT
+Default: 1.0 m long x 0.5 m wide, in lane 2 at x = 10 m, against the RIGHT
 side of the lane. Lane 2 spans y = 3.33 .. 6.67 m, so the obstacle covers
 y = 3.38 .. 3.88 m and leaves 6.67 - 3.88 = 2.79 m of lane free. The car is
 2 m wide, so it still fits inside lane 2, but has to shift left to get past.
@@ -24,7 +24,7 @@ OBSTACLE_WIDTH = 0.5    # m, across y
 
 @dataclass
 class Obstacle:
-    x: float = 25.0                 # m, centre
+    x: float = 10.0                 # m, centre
     y: float = 3.33 + 0.30          # m, centre: lane 2's right line + 0.3 m
     length: float = OBSTACLE_LENGTH
     width: float = OBSTACLE_WIDTH
