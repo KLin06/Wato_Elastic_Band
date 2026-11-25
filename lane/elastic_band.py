@@ -103,10 +103,7 @@ class ElasticBand:
         self.map = band_map
         self.k_c, self.k_r, self.k_ref = k_c, k_r, k_ref
 
-        # Reference line (N x 2), e.g. from reference.py. A KD-tree finds the
-        # nearest reference point to each bubble quickly. None = no pull.
-        self.reference = None if reference is None else np.asarray(reference, float)
-        self._ref_tree = None if reference is None else cKDTree(self.reference)
+        self.set_reference(reference)
         self.rho0, self.rho_max, self.rho_min = rho0, rho_max, rho_min
         self.alpha = alpha
         self.insert_overlap, self.delete_overlap = insert_overlap, delete_overlap
@@ -116,6 +113,13 @@ class ElasticBand:
         self.broken = False      # True if the band couldn't stay connected / collision free
         self.iterations = 0
         self.fix_connectivity()
+
+    def set_reference(self, reference):
+        """Reference line (N x 2), e.g. from reference.py, that the band is
+        pulled toward. A KD-tree finds the nearest reference point to each
+        bubble quickly. None = no pull."""
+        self.reference = None if reference is None else np.asarray(reference, float)
+        self._ref_tree = None if reference is None else cKDTree(self.reference)
 
     # ---- Bubbles -----------------------------------------------------------
     def radius(self, p):

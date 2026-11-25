@@ -35,6 +35,7 @@ CAR_LENGTH = 5.0     # m
 BAND_LENGTH = 15.0   # m of global path the elastic band covers, ahead of the car
 STOP_BACKOFF = 1.0   # m, the car stops this far before a point the corridor can't clear
 DETOUR_OFFSET = 0.1  # m off the reference that counts as a detour (status)
+LANE_SETTLE_MARGIN = 0.3  # m the car's sides must be inside the new lane before it becomes the boundary
 
 
 @dataclass
@@ -57,6 +58,7 @@ class Car:
     trail: list = field(default_factory=list, init=False, repr=False)  # positions driven so far
     # Allowed lanes as (x_from, x_to, (lowest_lane, highest_lane)) pieces; None = whole road.
     corridor: list = field(default=None, init=False, repr=False)
+    lane_change_target: int = field(default=None, init=False, repr=False)  # lane being changed into
     blocked_idx: int = field(default=None, init=False, repr=False)  # first reference point no shift can clear
 
     # ======================================================================
@@ -102,18 +104,20 @@ class Car:
         self._set_corridor(None)                    # search planner: whole road allowed
         return self._start_on_path()
 
-    def plan_reference(self, lane=2, target_lane=None, change_x=15.0, blend_length=20.0,
-                       corridor_margin=2.0):
+    def plan_reference(self, lane=2, target_lane=None, change_x=15.0, blend_length=20.0):
         """Use a reference line (reference.py) instead of the search planner:
         the centreline of `lane`, optionally blending into `target_lane`
         starting at `change_x` over `blend_length` metres. The band is pulled
         toward this line. Puts the car at its start. Returns the path.
 
         Also sets the allowed-lane CORRIDOR (what the decision layer authorises):
-          staying           : `lane` along the whole road
-          changing lanes    : `lane` before change_x; every lane from `lane` to
-                              `target_lane` from change_x until `corridor_margin`
-                              metres after the change ends; `target_lane` after.
+          staying         : `lane` along the whole road
+          changing lanes  : `lane` before change_x; every lane from `lane` to
+                            `target_lane` from change_x on. Once the car and its
+                            whole band are inside `target_lane`, the corridor
+                            narrows to `target_lane` from the car onward, so the
+                            new lane's lines become the hard boundaries
+                            (see _finish_lane_change()).
         """
         from reference import lane_reference
 
@@ -125,14 +129,50 @@ class Car:
         L = self.costmap.length
         if target_lane is None or target_lane == lane:
             corridor = [(0.0, L, (lane, lane))]
+            self.lane_change_target = None
         else:
             lo, hi = min(lane, target_lane), max(lane, target_lane)
-            end = change_x + blend_length + corridor_margin
             corridor = [(0.0, change_x, (lane, lane)),
-                        (change_x, end, (lo, hi)),
-                        (end, L, (target_lane, target_lane))]
+                        (change_x, L, (lo, hi))]
+            self.lane_change_target = target_lane
         self._set_corridor(corridor)
         return self._start_on_path()
+
+    def _in_lane(self, p, lane, margin=0.0):
+        """True if a car centred at p is entirely inside `lane`, with its sides
+        at least `margin` metres from the lane's lines."""
+        centre = self.costmap.centers[lane - 1]
+        allowed = self.costmap.lane_width / 2 - self.width / 2 - margin
+        return abs(p[1] - centre) <= allowed + 1e-9
+
+    def _finish_lane_change(self):
+        """Once the car AND every point of its band are inside the target lane
+        (sides at least LANE_SETTLE_MARGIN from its lines), narrow the corridor
+        to the target lane from the car's position onward.
+
+        Waiting for the whole band (not just the car) matters: if the corridor
+        narrowed while the band ahead was still crossing, those band points
+        would suddenly be inside a wall. The margin stops the new wall being
+        placed right against the car. Returns True if the corridor changed."""
+        target = self.lane_change_target
+        if target is None or self.band is None:
+            return False
+        if not all(self._in_lane(p, target, LANE_SETTLE_MARGIN) for p in self.band.points):
+            return False
+
+        # Keep the corridor behind the car as it was; target lane only from here on.
+        x = self.x
+        corridor = [(x0, min(x1, x), lanes) for x0, x1, lanes in self.corridor if x0 < x]
+        corridor.append((x, self.costmap.length, (target, target)))
+        self._set_corridor(corridor)
+        self.lane_change_target = None
+
+        # Rebuild what depends on the corridor: the obstacle-clear reference
+        # (shifts must now stay inside the target lane) and the band's map.
+        self.reference = self._clear_reference(self.global_path)
+        self.band.map = self.band_map
+        self.band.set_reference(self.reference)
+        return True
 
     # ======================================================================
     # Corridor (allowed lanes)
@@ -354,6 +394,9 @@ class Car:
         band.fix_connectivity()
         for _ in range(band_steps):
             band.step()
+
+        # 4) Lane change finished? Then the new lane becomes the hard boundary.
+        self._finish_lane_change()
         return float(np.linalg.norm(moved))
 
     def __str__(self):
