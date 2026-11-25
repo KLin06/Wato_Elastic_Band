@@ -51,11 +51,13 @@ EDGE_COST = LETHAL          # peak cost when the car's side touches a road edge
 OUT_OF_LANE_COST = 60       # part of the car over a dashed lane line (high, not lethal)
 NEAR_CENTER_COST = 1        # minimum cost just off the lane centre, so the centre itself is cheapest
 LINE_INFLUENCE = 0.2        # m, distance from the car's side at which a line's cost starts
+OBSTACLE_BUFFER_COST = 50   # peak cost when the car's outline is about to touch an obstacle
+OBSTACLE_INFLUENCE = 0.3    # m, gap between car and obstacle at which that cost starts
 
 
 class LaneCostmap:
     def __init__(self, length=ROAD_LENGTH, width=ROAD_WIDTH, n_lanes=N_LANES,
-                 resolution=RESOLUTION, car=None):
+                 resolution=RESOLUTION, car=None, obstacles=None):
         self.length, self.width = length, width
         self.n_lanes = n_lanes
         self.lane_width = width / n_lanes
@@ -79,7 +81,10 @@ class LaneCostmap:
 
         self.rows = int(round(width / resolution))     # cells across (y)
         self.cols = int(round(length / resolution))    # cells along (x)
+        self.obstacles = list(obstacles) if obstacles else []   # Obstacle objects (obstacle.py)
         self.grid = self._build()
+        for obs in self.obstacles:
+            self._stamp_obstacle(obs)
 
     def _build(self):
         # y of every row's cell centre. Every column is identical on a
@@ -118,6 +123,24 @@ class LaneCostmap:
         column = np.clip(np.rint(cost), 0, LETHAL).astype(np.int8)
         return np.repeat(column[:, None], self.cols, axis=1)
 
+    def _stamp_obstacle(self, obs):
+        """Add one obstacle to the grid (for the car's CENTRE):
+          - lethal wherever the car's outline would overlap the obstacle, i.e.
+            within obs.length/2 + car.length/2 along x AND
+                   obs.width/2  + car.width/2  across y of the obstacle's centre
+          - a buffer outside that: OBSTACLE_BUFFER_COST when the car is about
+            to touch, fading to 0 over OBSTACLE_INFLUENCE metres of gap
+        """
+        x = (np.arange(self.cols) + 0.5) * self.resolution
+        y = (np.arange(self.rows) + 0.5) * self.resolution
+        dx = np.abs(x[None, :] - obs.x) - (obs.length + self.car.length) / 2
+        dy = np.abs(y[:, None] - obs.y) - (obs.width + self.car.width) / 2
+        gap = np.hypot(np.maximum(dx, 0), np.maximum(dy, 0))     # car-to-obstacle gap (m)
+
+        cost = OBSTACLE_BUFFER_COST * np.clip(1 - gap / OBSTACLE_INFLUENCE, 0, 1)
+        cost[(dx <= 0) & (dy <= 0)] = LETHAL                     # overlap
+        self.grid = np.maximum(self.grid, np.rint(cost).astype(np.int8))
+
     # ---- Queries -----------------------------------------------------------
     def cost_at(self, x, y):
         """Cost at world point (x, y) in metres; LETHAL if off the map."""
@@ -147,6 +170,7 @@ class LaneCostmap:
                 f"+/-{self.allowed:.2f} m of a lane centre\n"
                 f"  lane lines at y = {np.round(self.boundaries, 2).tolist()}\n"
                 f"  lane centres at y = {np.round(self.centers, 2).tolist()}\n"
+                + "".join(f"  {o}\n" for o in self.obstacles) +
                 f"  cost range {g.min()}..{g.max()}, "
                 f"{(g == 0).mean() * 100:.1f}% free, {(g >= LETHAL).mean() * 100:.1f}% lethal")
 

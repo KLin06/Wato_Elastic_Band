@@ -16,18 +16,29 @@ OBSTACLE_COST is set just above OUT_OF_LANE_COST, so:
     a lane change from the global planner
 Costs below the threshold don't push the band at all.
 
-One update step (same as demo/band.py)
---------------------------------------
+One update step
+---------------
 For each bubble except the two fixed ends:
   1. contraction  k_c * (unit(prev - b) + unit(next - b))        tightens the band
   2. repulsion    k_r * (rho0 - rho) * grad(rho)  if rho < rho0  pushes off obstacles
-  3. drop the part of the force along the band
-  4. move by alpha * rho * force, capped at half the gap to the nearest
+  3. reference    k_ref * (nearest reference point - b)          pulls back toward the
+                                                                 lane (reference.py)
+  4. drop the part of the force along the band
+  5. move by alpha * rho * force, capped at half the gap to the nearest
      neighbour; halve the step if it would get within rho_min of an obstacle
 Then insert bubbles where neighbours stop overlapping and delete redundant ones.
+
+Not handled yet: the car's turning limit. Nothing stops the band bending
+tighter than the car can steer.
+
+Steps 1, 2, 4, 5 are Quinlan & Khatib (1993). Step 3 is the reference-path
+term used for on-road bands: TEB's path following (Rosmann et al. 2012/2013)
+and Autoware's elastic band smoother keep the band near a reference path the
+same way. Without it, contraction alone straightens the band across lanes.
 """
 import numpy as np
 from scipy.ndimage import distance_transform_edt, map_coordinates
+from scipy.spatial import cKDTree
 
 from lane_costmap import OUT_OF_LANE_COST, LaneCostmap
 
@@ -69,9 +80,10 @@ class BandMap:
 
 
 class ElasticBand:
-    def __init__(self, band_map: BandMap, path,
+    def __init__(self, band_map: BandMap, path, reference=None,
                  k_c=1.0,              # contraction gain: how hard the band tightens
                  k_r=4.0,              # repulsion gain: how hard obstacles push
+                 k_ref=1.0,            # reference gain: how hard the band is pulled to the reference
                  rho0=0.5,             # (m) repulsion acts only within this distance
                  rho_max=1.0,          # (m) cap on bubble radius
                  rho_min=0.05,         # (m) bubbles never get closer than this to an obstacle
@@ -80,7 +92,12 @@ class ElasticBand:
                  delete_overlap=0.6,   # delete b_i+1 if |b_i - b_i+2| < this * (r_i + r_i+2)
                  max_bubbles=500):
         self.map = band_map
-        self.k_c, self.k_r = k_c, k_r
+        self.k_c, self.k_r, self.k_ref = k_c, k_r, k_ref
+
+        # Reference line (N x 2), e.g. from reference.py. A KD-tree finds the
+        # nearest reference point to each bubble quickly. None = no pull.
+        self.reference = None if reference is None else np.asarray(reference, float)
+        self._ref_tree = None if reference is None else cKDTree(self.reference)
         self.rho0, self.rho_max, self.rho_min = rho0, rho_max, rho_min
         self.alpha = alpha
         self.insert_overlap, self.delete_overlap = insert_overlap, delete_overlap
@@ -105,6 +122,9 @@ class ElasticBand:
         rho = self.map.rho(b[i])
         if rho < self.rho0:                                                # repulsion
             f = f + self.k_r * (self.rho0 - rho) * self.map.grad_rho(b[i])
+        if self._ref_tree is not None:                                     # reference pull
+            _, j = self._ref_tree.query(b[i])
+            f = f + self.k_ref * (self.reference[j] - b[i])
         t = unit(b[i + 1] - b[i - 1])                                      # tangent
         return f - np.dot(f, t) * t                                        # sideways part only
 

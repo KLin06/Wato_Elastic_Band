@@ -48,6 +48,7 @@ class Car:
     costmap: object = field(default=None, init=False, repr=False)
     global_planner: object = field(default=None, init=False, repr=False)
     global_path: np.ndarray = field(default=None, init=False, repr=False)
+    reference: np.ndarray = field(default=None, init=False, repr=False)  # global path shifted clear of obstacles
     band_map: object = field(default=None, init=False, repr=False)
     band: object = field(default=None, init=False, repr=False)
     tail_idx: int = field(default=0, init=False, repr=False)   # last global-path index in the band
@@ -93,12 +94,79 @@ class Car:
         if self.global_planner is None:
             raise RuntimeError("call set_costmap() first")
         self.global_path, self.global_cost = self.global_planner.plan(start_y, end_y)
+        return self._start_on_path()
+
+    def plan_reference(self, lane=2, target_lane=None, change_x=15.0, blend_length=20.0):
+        """Use a reference line (reference.py) instead of the search planner:
+        the centreline of `lane`, optionally blending into `target_lane`
+        starting at `change_x` over `blend_length` metres. The band is pulled
+        toward this line. Puts the car at its start. Returns the path."""
+        from reference import lane_reference
+
+        if self.costmap is None:
+            raise RuntimeError("call set_costmap() first")
+        self.global_path = lane_reference(self.costmap, lane, target_lane, change_x, blend_length)
+        self.global_cost = float("nan")
+        return self._start_on_path()
+
+    def _start_on_path(self):
+        """Put the car at the start of the global path, facing along it, and
+        build the obstacle-free reference the band uses."""
+        self.reference = self._clear_reference(self.global_path)
         self.x, self.y = self.global_path[0]
         d = self.global_path[1] - self.global_path[0]
         self.yaw = float(np.arctan2(d[1], d[0]))
         self.band = None
         self.trail = [self.position.copy()]
         return self.global_path
+
+    def _clear_shift(self, p, sign=None, max_shift=3.0, rho_min=0.05):
+        """Smallest sideways (y) shift that moves `p` clear of obstacles, or None.
+        sign=None tries both sides (left first on a tie); +1 / -1 forces a side."""
+        if self.band_map.rho(p) >= rho_min:
+            return 0.0
+        res = self.costmap.resolution
+        for k in range(1, int(max_shift / res) + 1):
+            for s in ((1, -1) if sign is None else (sign,)):
+                if self.band_map.rho(np.array([p[0], p[1] + s * k * res])) >= rho_min:
+                    return s * k * res
+        return None
+
+    def _clear_reference(self, path, margin=5.0):
+        """The global path, shifted sideways around obstacles. Used both to seed
+        new band points and as what the band is pulled toward.
+
+        Why: the reference line (lane centre) can run straight through an
+        obstacle. The band can't start inside one (its bubbles would have zero
+        radius), and pulling it toward a point inside one makes the pull fight
+        the obstacle repulsion until the band breaks. So every point within
+        `margin` metres before or after a blocked stretch gets that stretch's
+        shift: the sideways jumps happen in free space and the band smooths them.
+
+        Prototype simplification: shifts along y (the road is straight along x).
+        A real implementation would shift along the path's normal."""
+        path = np.asarray(path, float)
+        shifts = np.zeros(len(path))
+        sign = None
+        for j, p in enumerate(path):                       # shift needed at each point
+            s = self._clear_shift(p, sign)
+            if s:                                          # blocked: keep one side per obstacle
+                shifts[j], sign = s, (1 if s > 0 else -1)
+            else:
+                sign = None if s == 0.0 else sign
+
+        # Spread each shift `margin` metres before and after (largest wins).
+        ds = max(np.linalg.norm(path[1] - path[0]), 1e-6)
+        n = int(margin / ds)
+        spread = shifts.copy()
+        for j in np.nonzero(shifts)[0]:
+            lo, hi = max(j - n, 0), min(j + n + 1, len(path))
+            window = spread[lo:hi]
+            spread[lo:hi] = np.where(np.abs(window) >= abs(shifts[j]), window, shifts[j])
+
+        clear = path.copy()
+        clear[:, 1] += spread
+        return clear
 
     def band_window(self):
         """The piece of the global path the band covers: from the car's position
@@ -114,7 +182,7 @@ class Car:
         self.tail_idx = i0
         for j in range(i0 + 1, len(path)):
             dist += float(np.linalg.norm(path[j] - window[-1]))
-            window.append(path[j])
+            window.append(self.reference[j])
             self.tail_idx = j
             if dist >= self.band_length:
                 break
@@ -126,7 +194,9 @@ class Car:
         `band_length` metres ahead on the global path. Returns the band."""
         from elastic_band import ElasticBand
 
-        self.band = ElasticBand(self.band_map, self.band_window(), **band_params)
+        # The band is pulled toward the obstacle-free reference.
+        self.band = ElasticBand(self.band_map, self.band_window(),
+                                reference=self.reference, **band_params)
         self.band.run(max_iter=max_iter)
         return self.band
 
@@ -186,7 +256,7 @@ class Car:
         while length < self.band_length and self.tail_idx < len(path) - 1:
             self.tail_idx += 1
             length += float(np.linalg.norm(path[self.tail_idx] - new_pts[-1]))
-            new_pts.append(path[self.tail_idx])
+            new_pts.append(self.reference[self.tail_idx])
 
         # 3) Let the band relax a little.
         band.points = np.array(new_pts)

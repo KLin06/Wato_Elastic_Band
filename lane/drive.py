@@ -5,12 +5,20 @@ Each frame the car calls drive_step(): it moves `--speed` metres along its
 elastic band, the band slides forward along the global path to stay
 BAND_LENGTH (15 m) long, and the band relaxes for a few steps.
 
-  python drive.py                               lane 2 -> lane 2
-  python drive.py --start-y 1.67 --end-y 8.33   lane changes
-  python drive.py --end-y 8.33 --save drive.gif save a GIF instead of a window
+Default: REFERENCE LINE mode (reference.py): the global path is the lane
+centreline (optionally blending into another lane), and the band is pulled
+toward it while being pushed off obstacles.
 
-On screen: grey dashed = global path, blue = elastic band (circles = bubbles),
-green line = where the car has driven, green box = the car.
+  python drive.py                                   lane 2, obstacle at the side of lane 2
+  python drive.py --obstacle-y 5.0                  obstacle in the middle of lane 2
+  python drive.py --target-lane 3 --change-x 15     lane change 2 -> 3
+  python drive.py --planner search --end-y 8.33     old search planner instead
+  python drive.py --save drive.gif                  save a GIF instead of a window
+
+On screen: grey dashed = global path, cyan dotted = reference the band is
+pulled toward (global path shifted clear of obstacles), blue = elastic band
+(circles = bubbles), green line = where the car has driven, green box = the
+car, red box = the obstacle.
 """
 import argparse
 
@@ -22,23 +30,47 @@ from matplotlib.patches import Circle, Polygon
 
 from car import Car
 from lane_costmap import LETHAL, LaneCostmap
+from obstacle import Obstacle
 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--start-y", type=float, default=None, help="start y (default: lane 2 centre)")
-    ap.add_argument("--end-y", type=float, default=None, help="end y (default: lane 2 centre)")
+    ap.add_argument("--planner", choices=["reference", "search"], default="reference",
+                    help="reference line (default) or the search planner (planner.py)")
+    ap.add_argument("--lane", type=int, default=2, help="reference mode: start lane (default 2)")
+    ap.add_argument("--target-lane", type=int, default=None,
+                    help="reference mode: lane to change into (default: stay)")
+    ap.add_argument("--change-x", type=float, default=15.0,
+                    help="reference mode: x where the lane change starts (default 15)")
+    ap.add_argument("--blend", type=float, default=20.0,
+                    help="reference mode: lane-change length in m (default 20)")
+    ap.add_argument("--start-y", type=float, default=None, help="search mode: start y (default: lane 2 centre)")
+    ap.add_argument("--end-y", type=float, default=None, help="search mode: end y (default: lane 2 centre)")
+    ap.add_argument("--obstacle-x", type=float, default=None, help="obstacle x (default 25)")
+    ap.add_argument("--obstacle-y", type=float, default=None,
+                    help="obstacle y (default 3.63: right side of lane 2)")
     ap.add_argument("--speed", type=float, default=0.2, help="metres driven per frame (default 0.2)")
     ap.add_argument("--band-steps", type=int, default=3,
                     help="band updates per frame (default 3)")
     ap.add_argument("--save", metavar="FILE.gif", help="save a GIF instead of showing a window")
+    ap.add_argument("--no-obstacle", action="store_true",
+                    help="drive on an empty road (default: one obstacle in lane 2)")
     args = ap.parse_args()
 
     car = Car()
-    cm = LaneCostmap(car=car)
+    obs = Obstacle()
+    if args.obstacle_x is not None:
+        obs.x = args.obstacle_x
+    if args.obstacle_y is not None:
+        obs.y = args.obstacle_y
+    obstacles = [] if args.no_obstacle else [obs]
+    cm = LaneCostmap(car=car, obstacles=obstacles)
     car.set_costmap(cm)
-    car.plan(args.start_y, args.end_y)
+    if args.planner == "reference":
+        car.plan_reference(args.lane, args.target_lane, args.change_x, args.blend)
+    else:
+        car.plan(args.start_y, args.end_y)
     car.update_band()
 
     # ---- Static background ---------------------------------------------------
@@ -52,8 +84,14 @@ def main():
     for k, cy in enumerate(cm.centers):
         ax.text(0.5, cy, f"Lane {k + 1}", va="center", fontsize=9, weight="bold",
                 bbox=dict(facecolor="white", alpha=0.8, lw=0))
+    for obs in obstacles:
+        ax.add_patch(Polygon(obs.footprint(), closed=True, fc="tab:red", ec="black",
+                             zorder=6, label="obstacle"))
     gp = car.global_path
     ax.plot(gp[:, 0], gp[:, 1], "--", color="gray", lw=1.5, label="global path")
+    ref = car.reference
+    if not np.allclose(ref, gp):
+        ax.plot(ref[:, 0], ref[:, 1], ":", color="tab:cyan", lw=1.5, label="reference (clear)")
 
     # ---- Moving parts --------------------------------------------------------
     (trail_line,) = ax.plot([], [], "-", color="tab:green", lw=2, label="driven")
