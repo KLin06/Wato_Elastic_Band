@@ -10,13 +10,15 @@ again only if an obstacle cuts the band.
 
 ## Setup
 
-Requires Python 3.10+. Run everything from this `demo/` folder.
+Requires Python 3.10+. The virtual environment and `requirements.txt` live in
+the `elastic_band/` folder (one level up) and are shared with `lane/`.
 
 ```powershell
-cd demo
+# from elastic_band/
 python -m venv .venv
 .venv\Scripts\Activate.ps1          # macOS/Linux: source .venv/bin/activate
 pip install -r requirements.txt
+cd demo                             # run the commands below from demo/
 ```
 
 ## Running
@@ -182,4 +184,4 @@ band drives a similar route while only ever updating about 3 m of band.
 | `local_band.py` | `LocalElasticBand` class (sliding window that moves with the robot) |
 | `visualize.py` | `BandAnimator`, `LocalBandAnimator` and `MovingObstacle` |
 | `main.py` | Command-line entry point |
-| `requirements.txt` | Pinned `numpy`, `scipy`, `matplotlib` |
+| `../requirements.txt` | Pinned `numpy`, `scipy`, `matplotlib` (shared, in `elastic_band/`) |
